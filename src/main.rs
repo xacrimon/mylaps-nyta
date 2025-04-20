@@ -3,7 +3,6 @@ use clap::Parser;
 use core::num;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::os::unix::raw::time_t;
 use std::sync::LazyLock;
 use std::{path::PathBuf, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,11 +42,8 @@ async fn main() -> Result<()> {
 
     log::info!("listening on {}", bind_addr);
 
-    let (signal_tx, signal_rx) = oneshot::channel();
-    let mut signal_tx = Some(signal_tx);
-    let mut signal_rx = Some(signal_rx);
-
-    ctrlc::set_handler(move || signal_tx.take().unwrap().send(()).unwrap())
+    let (signal_tx, mut signal_rx) = mpsc::channel(100);
+    ctrlc::set_handler(move || signal_tx.blocking_send(()).unwrap())
         .expect("error setting Ctrl-C handler");
 
     let (time_tx, time_rx) = mpsc::channel(100);
@@ -60,8 +56,8 @@ async fn main() -> Result<()> {
 
     loop {
         select! {
-            _ = signal_rx.take().unwrap() => {
-                log::info!("received Ctrl-C, shutting down...");
+            _ = signal_rx.recv() => {
+                log::info!("received Ctrl-C, shutting down");
                 break;
             }
 
@@ -91,13 +87,13 @@ async fn handle_connection(mut socket: TcpStream, mut time_tx: mpsc::Sender<Stri
                 Ok(0) => break 'outer,
                 Ok(1) => {
                     if b[0] == b'$' {
+                        let sub = line.trim();
+                        process_line(&mut socket, sub, &mut time_tx).await?;
+                        line.clear();
                         break;
                     }
 
                     line.push(b[0] as char);
-                    let sub = line.trim();
-                    process_line(&mut socket, sub, &mut time_tx).await?;
-                    line.clear();
                 }
                 Err(e) => bail!("error reading from socket: {}", e),
                 _ => unreachable!(),
@@ -117,7 +113,6 @@ async fn process_line(
     log::info!("received line: {}", line);
     let parts = line.split('@').collect::<Vec<_>>();
 
-    assert!(parts.last() == Some(&"$"));
     let [_, cmd, data @ ..] = &parts[..] else {
         bail!("invalid command");
     };
@@ -130,8 +125,8 @@ async fn process_line(
             socket.write_all(b"Nyta@AckPong@Version2.1@$").await?;
         }
         "Passing" => {
-            let [records @ .., num] = data else {
-                bail!("invalid store command");
+            let [records @ .., num, _] = data else {
+                bail!("invalid passing command");
             };
 
             dbg!(records, num);
@@ -167,14 +162,16 @@ async fn push_passings_from(mut time_rx: mpsc::Receiver<String>, config: &Config
         }
 
         dbg!(&map);
-        let bib: u32 = map
-            .get("b")
-            .ok_or_else(|| anyhow!("missing bib"))?
-            .parse()?;
+        let mut chip: String = map
+            .get("c")
+            .ok_or_else(|| anyhow!("missing chip"))?
+            .to_string();
+
+        chip.insert(2, '-');
 
         loop {
-            match push_passing_single(&client, bib, config).await {
-                Ok(_) => continue,
+            match push_passing_single(&client, &chip, config).await {
+                Ok(_) => break,
                 Err(e) => {
                     log::error!("failed to push passing: {}", e);
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -189,18 +186,18 @@ async fn push_passings_from(mut time_rx: mpsc::Receiver<String>, config: &Config
 
 async fn push_passing_single(
     client: &reqwest::Client, /* , time: i64*/
-    bib: u32,
+    chip: &str,
     config: &Config,
 ) -> Result<()> {
     let uri = format!("https://nytatime.se{}", config.nyta_uri);
     client
         .get(&uri)
         //.query(&[(("bib", bib), "time", time)])
-        .query(&[(("bib", bib))])
+        .query(&[(("bib", chip))])
         .send()
         .await?
         .error_for_status()?;
 
-    log::info!("pushed passing for bib {} to NytaTiming", bib,);
+    log::info!("pushed passing for chip {} to NytaTiming", chip,);
     Ok(())
 }
