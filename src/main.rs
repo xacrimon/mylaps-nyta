@@ -192,7 +192,8 @@ async fn push_passing_single(
     let uri = format!("https://nytatime.se{}", config.nyta_uri);
     client
         .get(&uri)
-        .query(&[(("bib", chip), "time", time)])
+        //.query(&[(("bib", chip), "time", time)])
+        .query(&[(("bib", chip))])
         .send()
         .await?
         .error_for_status()?;
