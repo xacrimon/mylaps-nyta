@@ -1,21 +1,19 @@
-use anyhow::{Error, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use core::num;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::LazyLock;
-use std::{path::PathBuf, sync::Arc};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::path::PathBuf;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio::select;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::{
     fs,
     net::{TcpListener, TcpStream},
 };
 
-#[derive(Debug, Parser)] // requires `derive` feature
+#[derive(Debug, Parser)]
 #[command(name = "mylaps-nyta")]
-#[command(about = "Läs in tider från MyLaps till NytaTiming", long_about = None)]
+#[command(about = "MyLaps TCP/IP exporter till NytaTiming", long_about = None)]
 struct Cli {
     #[arg(short, long)]
     config: PathBuf,
@@ -34,23 +32,25 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let config_data = fs::read_to_string(&args.config).await?;
-    let config: Config =
-        toml::from_str(&config_data).map_err(|e| anyhow!("failed to parse config file: {}", e))?;
+    let config: Config = toml::from_str(&config_data).context("failed to parse config file")?;
 
     let bind_addr = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&bind_addr).await?;
-
     log::info!("listening on {}", bind_addr);
 
-    let (signal_tx, mut signal_rx) = mpsc::channel(100);
+    let (time_tx, mut time_rx) = mpsc::channel(1000);
+    let (signal_tx, mut signal_rx) = mpsc::channel(1);
     ctrlc::set_handler(move || signal_tx.blocking_send(()).unwrap())
-        .expect("error setting Ctrl-C handler");
-
-    let (time_tx, time_rx) = mpsc::channel(100);
+        .context("error setting Ctrl-C handler")?;
 
     tokio::spawn(async move {
-        if let Err(e) = push_passings_from(time_rx, &config).await {
-            log::error!("error pushing passings: {}", e);
+        loop {
+            if let Err(e) = push_passings_from(&mut time_rx, &config).await {
+                log::error!(
+                    "fatal pushing passings: {}, restarting export API worker",
+                    e
+                );
+            }
         }
     });
 
@@ -77,12 +77,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(mut socket: TcpStream, mut time_tx: mpsc::Sender<String>) -> Result<()> {
+async fn handle_connection(socket: TcpStream, mut time_tx: mpsc::Sender<String>) -> Result<()> {
+    let mut socket = BufStream::new(socket);
+
     'outer: loop {
         let mut line = String::new();
         let mut b = [0u8; 1];
 
-        loop {
+        'inner: loop {
             match socket.read(&mut b).await {
                 Ok(0) => break 'outer,
                 Ok(1) => {
@@ -90,7 +92,7 @@ async fn handle_connection(mut socket: TcpStream, mut time_tx: mpsc::Sender<Stri
                         let sub = line.trim();
                         process_line(&mut socket, sub, &mut time_tx).await?;
                         line.clear();
-                        break;
+                        break 'inner;
                     }
 
                     line.push(b[0] as char);
@@ -106,62 +108,59 @@ async fn handle_connection(mut socket: TcpStream, mut time_tx: mpsc::Sender<Stri
 }
 
 async fn process_line(
-    socket: &mut TcpStream,
+    socket: &mut BufStream<TcpStream>,
     line: &str,
     time_tx: &mut mpsc::Sender<String>,
 ) -> Result<()> {
     log::info!("received line: {}", line);
-    let parts = line.split('@').collect::<Vec<_>>();
+    let parts: Vec<&str> = line.split('@').collect();
 
     let [_, cmd, data @ ..] = &parts[..] else {
         bail!("invalid command");
     };
 
     match *cmd {
-        "Ping" => {
-            socket.write_all(b"Nyta@AckPing@$").await?;
-        }
-        "Pong" => {
-            socket.write_all(b"Nyta@AckPong@Version2.1@$").await?;
-        }
+        "Ping" => socket.write_all(b"NytaTiming@AckPing@$").await?,
+        "Pong" => socket.write_all(b"NytaTiming@AckPong@Version2.1@$").await?,
         "Passing" => {
             let [records @ .., num, _] = data else {
                 bail!("invalid passing command");
             };
 
-            dbg!(records, num);
             let num = num.parse::<u32>()?;
-
             for record in records {
                 time_tx.send(record.to_string()).await?;
             }
 
-            let reply = format!("Nyta@AckPassing@{}@$", num);
+            let reply = format!("NytaTiming@AckPassing@{}@$", num);
             socket.write_all(reply.as_bytes()).await?;
         }
         _ => {
             log::warn!("unknown command: {}", cmd);
-            return Ok(());
         }
     }
 
+    socket.flush().await?;
     Ok(())
 }
 
-async fn push_passings_from(mut time_rx: mpsc::Receiver<String>, config: &Config) -> Result<()> {
+async fn push_passings_from(time_rx: &mut mpsc::Receiver<String>, config: &Config) -> Result<()> {
     let client = reqwest::Client::new();
 
     while let Some(record) = time_rx.recv().await {
         let mut map = HashMap::new();
         for pair in record.split('|') {
             let mut parts = pair.split('=');
-            let key = parts.next().unwrap();
-            let value = parts.next().unwrap();
+            let key = parts
+                .next()
+                .ok_or_else(|| anyhow!("received record missing key"))?;
+            let value = parts
+                .next()
+                .ok_or_else(|| anyhow!("received record missing value"))?;
 
             map.insert(key, value);
         }
 
-        dbg!(&map);
         let mut chip: String = map
             .get("c")
             .ok_or_else(|| anyhow!("missing chip"))?
@@ -170,7 +169,7 @@ async fn push_passings_from(mut time_rx: mpsc::Receiver<String>, config: &Config
         chip.insert(2, '-');
 
         loop {
-            match push_passing_single(&client, &chip, config).await {
+            match push_passing_single(&client, &chip, 0, config).await {
                 Ok(_) => break,
                 Err(e) => {
                     log::error!("failed to push passing: {}", e);
@@ -185,15 +184,15 @@ async fn push_passings_from(mut time_rx: mpsc::Receiver<String>, config: &Config
 }
 
 async fn push_passing_single(
-    client: &reqwest::Client, /* , time: i64*/
+    client: &reqwest::Client,
     chip: &str,
+    time: i64,
     config: &Config,
 ) -> Result<()> {
     let uri = format!("https://nytatime.se{}", config.nyta_uri);
     client
         .get(&uri)
-        //.query(&[(("bib", bib), "time", time)])
-        .query(&[(("bib", chip))])
+        .query(&[(("bib", chip), "time", time)])
         .send()
         .await?
         .error_for_status()?;
