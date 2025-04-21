@@ -1,0 +1,26 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install toolchain
+        run: |
+          sudo apt-get install -y gcc-mingw-w64-x86-64-win32 binutils-mingw-w64-x86-64
+          cargo version
+          rustup target install x86_64-pc-windows-gnu
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-gnu
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-pc-windows-gnu
+          path: |
+            target/x86_64-pc-windows-gnu/release/mylaps-nyta.exe
